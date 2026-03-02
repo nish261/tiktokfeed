@@ -13,6 +13,7 @@ State:  ~/.tiktok_discord_state.json
 
 import json
 import os
+import re
 import sys
 import time
 import subprocess
@@ -79,6 +80,29 @@ def _cookie_args() -> list[str]:
         if path.exists():
             return ["--cookies", str(path)]
     return []
+
+def resolve_account_from_url(url: str) -> Optional[str]:
+    """
+    Given any TikTok URL (share link, video URL, profile URL),
+    follow redirects and extract the @username.
+
+    Handles:
+      https://www.tiktok.com/t/ZP8x5Yk6V/        (short share link)
+      https://www.tiktok.com/@username/video/...   (full video URL)
+      https://www.tiktok.com/@username             (profile URL)
+      https://vm.tiktok.com/...                    (vm short link)
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+        resp = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
+        final_url = resp.url
+        match = re.search(r'/@([^/?&#]+)', final_url)
+        if match:
+            return "@" + match.group(1)
+    except Exception as e:
+        log.warning(f"resolve_account_from_url: {e}")
+    return None
+
 
 def fetch_latest_videos(account: str) -> list[dict]:
     """Get latest video metadata from a TikTok profile (flat, no download)."""

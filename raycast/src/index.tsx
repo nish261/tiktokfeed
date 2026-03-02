@@ -78,15 +78,62 @@ function formatInterval(seconds: number): string {
   return `${Math.round(seconds / 60)}m`;
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function isURL(input: string): boolean {
+  return input.startsWith("http://") || input.startsWith("https://");
+}
+
+function resolveAccountFromURL(url: string): string {
+  // Run inline Python to follow redirects and extract @username
+  const script = `
+import re, requests, sys
+try:
+    resp = requests.head(${JSON.stringify(url)}, allow_redirects=True, timeout=15,
+        headers={"User-Agent": "Mozilla/5.0"})
+    m = re.search(r'/@([^/?&#]+)', resp.url)
+    print(m.group(1) if m else "", end="")
+except Exception as e:
+    print("", end="")
+`.trim();
+  try {
+    const result = execSync(`python3 -c '${script.replace(/'/g, `'"'"'`)}'`, { encoding: "utf-8", timeout: 20000 });
+    return result.trim() ? "@" + result.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 // ── Add Account Form ──────────────────────────────────────────────────────────
 
 function AddAccountForm({ onAdded }: { onAdded: () => void }) {
   const { pop } = useNavigation();
+  const [isResolving, setIsResolving] = useState(false);
 
   async function handleSubmit(values: { account: string }) {
-    let account = values.account.trim();
-    if (!account) return;
-    if (!account.startsWith("@")) account = "@" + account;
+    let input = values.account.trim();
+    if (!input) return;
+
+    let account = input;
+
+    if (isURL(input)) {
+      setIsResolving(true);
+      const toast = await showToast({ style: Toast.Style.Animated, title: "Resolving link...", message: input });
+      account = resolveAccountFromURL(input);
+      setIsResolving(false);
+
+      if (!account) {
+        toast.style = Toast.Style.Failure;
+        toast.title = "Couldn't find account";
+        toast.message = "Make sure the link is a valid TikTok URL";
+        return;
+      }
+      toast.style = Toast.Style.Success;
+      toast.title = "Found account";
+      toast.message = account;
+    } else {
+      if (!account.startsWith("@")) account = "@" + account;
+    }
 
     try {
       const cfg = readConfig();
@@ -107,13 +154,20 @@ function AddAccountForm({ onAdded }: { onAdded: () => void }) {
   return (
     <Form
       navigationTitle="Add Account"
+      isLoading={isResolving}
       actions={
         <ActionPanel>
           <Action.SubmitForm title="Add Account" icon={Icon.Plus} onSubmit={handleSubmit} />
         </ActionPanel>
       }
     >
-      <Form.TextField id="account" title="TikTok Username" placeholder="@username" autoFocus />
+      <Form.TextField
+        id="account"
+        title="TikTok Username or Link"
+        placeholder="@username  or  https://www.tiktok.com/t/..."
+        autoFocus
+      />
+      <Form.Description text="Paste a share link, video URL, or profile URL — the account will be resolved automatically." />
     </Form>
   );
 }
