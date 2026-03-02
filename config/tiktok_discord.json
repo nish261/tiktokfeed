@@ -1,8 +1,10 @@
 {
   "webhook_url": "YOUR_DISCORD_WEBHOOK_URL",
   "accounts": [
-    "@username1",
-    "@username2"
+    {
+      "username": "@username1",
+      "reposts": false
+    }
   ],
   "interval": 300
 }

@@ -63,6 +63,26 @@ def save_state(state: dict):
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+def normalize_accounts(raw: list) -> list[dict]:
+    """
+    Accept either old string format or new object format per account.
+      Old: ["@username"]
+      New: [{"username": "@username", "reposts": true}]
+    Always returns list of dicts with at least {username, reposts}.
+    """
+    out = []
+    for a in raw:
+        if isinstance(a, str):
+            u = a if a.startswith("@") else "@" + a
+            out.append({"username": u, "reposts": False})
+        elif isinstance(a, dict):
+            u = a.get("username", "")
+            if u and not u.startswith("@"):
+                u = "@" + u
+            out.append({"username": u, "reposts": bool(a.get("reposts", False))})
+    return out
+
+
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         log.error(f"Config not found: {CONFIG_PATH}")
@@ -70,6 +90,7 @@ def load_config() -> dict:
     cfg = json.loads(CONFIG_PATH.read_text())
     assert cfg.get("webhook_url"), "webhook_url missing in config"
     assert cfg.get("accounts"),    "accounts list missing in config"
+    cfg["accounts"] = normalize_accounts(cfg["accounts"])
     return cfg
 
 # ── TikTok Fetch ──────────────────────────────────────────────────────────────
@@ -104,10 +125,13 @@ def resolve_account_from_url(url: str) -> Optional[str]:
     return None
 
 
-def fetch_latest_videos(account: str) -> list[dict]:
-    """Get latest video metadata from a TikTok profile (flat, no download)."""
+def fetch_latest_videos(account: str, reposts: bool = False) -> list[dict]:
+    """
+    Get latest video metadata from a TikTok profile (flat, no download).
+    reposts=True fetches from the /repost tab instead of the main feed.
+    """
     username = account.lstrip("@")
-    url = f"https://www.tiktok.com/@{username}"
+    url = f"https://www.tiktok.com/@{username}/repost" if reposts else f"https://www.tiktok.com/@{username}"
 
     cmd = [
         sys.executable, "-m", "yt_dlp",
@@ -132,7 +156,7 @@ def fetch_latest_videos(account: str) -> list[dict]:
                     pass
         return videos
     except subprocess.TimeoutExpired:
-        log.warning(f"Timeout fetching {account}")
+        log.warning(f"Timeout fetching {account} ({'reposts' if reposts else 'videos'})")
         return []
     except Exception as e:
         log.error(f"fetch_latest_videos({account}): {e}")
@@ -247,7 +271,7 @@ def post_video_to_discord(webhook_url: str, video: dict, account: str, file_path
                     timeout=30,
                 )
 
-            if resp.status_code == 204:
+            if resp.status_code in (200, 204):
                 log.info(f"  Posted {video['id']} ({'file' if file_path and not file_too_large else 'link'})")
                 return True
             elif resp.status_code == 429:
@@ -265,45 +289,67 @@ def post_video_to_discord(webhook_url: str, video: dict, account: str, file_path
 
 # ── Core Loop ─────────────────────────────────────────────────────────────────
 
-def check_account(account: str, webhook_url: str, state: dict) -> int:
-    """Check one account, download + post any new videos. Returns count posted."""
-    log.info(f"Checking @{account.lstrip('@')}...")
-    videos = fetch_latest_videos(account)
+def _check_playlist(account: str, reposts: bool, webhook_url: str, state: dict) -> int:
+    """
+    Check one playlist (videos or reposts) for an account.
+    State key: '{username}' for videos, '{username}:reposts' for reposts.
+    Returns count of new videos posted.
+    """
+    label    = "reposts" if reposts else "videos"
+    base_key = account.lstrip("@").lower()
+    state_key = f"{base_key}:reposts" if reposts else base_key
+
+    videos = fetch_latest_videos(account, reposts=reposts)
 
     if not videos:
-        log.info("  No videos returned")
+        log.info(f"  [{label}] No videos returned")
         return 0
 
-    key      = account.lstrip("@").lower()
-    seen_ids = set(state.get(key, []))
+    seen_ids = set(state.get(state_key, []))
     new_vids = [v for v in videos if v.get("id") and v["id"] not in seen_ids]
 
     if not new_vids:
-        log.info(f"  Up to date (latest: {videos[0].get('id', '?')})")
+        log.info(f"  [{label}] Up to date (latest: {videos[0].get('id', '?')})")
         return 0
 
-    log.info(f"  {len(new_vids)} new video(s)")
+    log.info(f"  [{label}] {len(new_vids)} new video(s)")
 
-    # Post oldest-first (chronological order in Discord)
+    # Post oldest-first so Discord feed reads chronologically
     for video in reversed(new_vids):
         video_url = video.get("webpage_url") or video.get("url", "")
+
+        # Add repost label to caption
+        display_account = account + (" ↩️ repost" if reposts else "")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             file_path = download_video_no_watermark(video_url, tmp_dir)
             if file_path:
                 log.info(f"  Downloaded: {os.path.basename(file_path)} ({os.path.getsize(file_path)//1024}KB)")
             else:
-                log.warning(f"  Download failed for {video['id']}, will post link only")
+                log.warning(f"  Download failed for {video['id']}, posting link only")
 
-            ok = post_video_to_discord(webhook_url, video, account, file_path)
+            ok = post_video_to_discord(webhook_url, video, display_account, file_path)
 
         if ok:
             seen_ids.add(video["id"])
 
-        time.sleep(2)  # avoid Discord rate limits between posts
+        time.sleep(2)
 
-    state[key] = list(seen_ids)[-200:]
+    state[state_key] = list(seen_ids)[-200:]
     return len(new_vids)
+
+
+def check_account(account_cfg: dict, webhook_url: str, state: dict) -> int:
+    """Check an account (videos + optionally reposts). Returns count posted."""
+    username        = account_cfg["username"]
+    include_reposts = account_cfg.get("reposts", False)
+
+    log.info(f"Checking {username}{' (+ reposts)' if include_reposts else ''}...")
+
+    total = _check_playlist(username, False, webhook_url, state)
+    if include_reposts:
+        total += _check_playlist(username, True, webhook_url, state)
+    return total
 
 
 def run_loop(cfg: dict):
@@ -313,16 +359,17 @@ def run_loop(cfg: dict):
 
     log.info("=" * 60)
     log.info("TikTok → Discord Feed started")
-    log.info(f"Accounts : {', '.join(accounts)}")
+    for a in accounts:
+        log.info(f"  Watching : {a['username']}{' + reposts' if a.get('reposts') else ''}")
     log.info(f"Interval : {interval}s")
     log.info(f"State    : {STATE_FILE}")
     log.info(f"Log      : {LOG_FILE}")
     log.info("=" * 60)
 
     while True:
-        # Reload config each cycle — add/remove accounts without restarting
+        # Reload config each cycle — changes take effect without restart
         try:
-            cfg = load_config()
+            cfg         = load_config()
             accounts    = cfg["accounts"]
             webhook_url = cfg["webhook_url"]
             interval    = cfg.get("interval", DEFAULT_INTERVAL)
@@ -335,14 +382,10 @@ def run_loop(cfg: dict):
             try:
                 total += check_account(account, webhook_url, state)
             except Exception as e:
-                log.error(f"Error checking {account}: {e}")
+                log.error(f"Error checking {account['username']}: {e}")
         save_state(state)
 
-        if total:
-            log.info(f"Cycle done — posted {total} video(s)")
-        else:
-            log.info(f"Cycle done — nothing new")
-
+        log.info(f"Cycle done — posted {total} video(s)" if total else "Cycle done — nothing new")
         log.info(f"Sleeping {interval}s...\n")
         time.sleep(interval)
 
